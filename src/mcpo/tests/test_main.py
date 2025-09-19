@@ -2,7 +2,7 @@ import pytest
 from pydantic import BaseModel, Field
 from typing import Any, List, Dict, Union
 
-from mcpo.utils.main import _process_schema_property
+from mcpo.utils.main import _process_schema_property, get_model_fields
 
 
 _model_cache = {}
@@ -325,3 +325,48 @@ def test_ref_to_parent_node():
 
     assert result_type == Any
     assert result_field.description == ""
+
+
+def test_nested_defs_reference_resolves_via_json_pointer():
+    schema = {
+        "type": "object",
+        "$defs": {"Global": {"type": "string"}},
+        "properties": {
+            "container": {
+                "type": "object",
+                "$defs": {
+                    "LocalDetails": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string", "description": "Nested label"}
+                        },
+                        "required": ["label"],
+                    }
+                },
+                "properties": {
+                    "value": {
+                        "$ref": "#/$defs/LocalDetails/properties/label"
+                    }
+                },
+                "required": ["value"],
+            }
+        },
+        "required": ["container"],
+    }
+
+    model_fields = get_model_fields(
+        "json_pointer_form_model",
+        schema["properties"],
+        schema["required"],
+        schema.get("$defs", {}),
+        schema,
+    )
+
+    container_type, container_field = model_fields["container"]
+    assert container_field.default is ...
+    assert issubclass(container_type, BaseModel)
+
+    nested_fields = container_type.model_fields
+    assert "value" in nested_fields
+    assert nested_fields["value"].annotation is str
+    assert nested_fields["value"].is_required()
