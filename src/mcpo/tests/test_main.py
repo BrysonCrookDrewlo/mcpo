@@ -370,3 +370,54 @@ def test_nested_defs_reference_resolves_via_json_pointer():
     assert "value" in nested_fields
     assert nested_fields["value"].annotation is str
     assert nested_fields["value"].is_required()
+
+
+def test_self_referential_defs_schema():
+    schema = {
+        "type": "object",
+        "$defs": {
+            "Directory": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Directory name"},
+                    "children": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/Directory"},
+                    },
+                },
+                "required": ["name"],
+            }
+        },
+        "properties": {
+            "root": {"$ref": "#/$defs/Directory"},
+            "metadata": {"type": "object", "properties": {"created_by": {"type": "string"}}},
+        },
+        "required": ["root"],
+    }
+
+    model_fields = get_model_fields(
+        "self_ref_form_model",
+        schema["properties"],
+        schema["required"],
+        schema.get("$defs", {}),
+        schema,
+    )
+
+    root_type, root_field = model_fields["root"]
+    assert root_field.default is ...
+    assert issubclass(root_type, BaseModel)
+
+    root_fields = root_type.model_fields
+    assert "name" in root_fields
+    assert root_fields["name"].annotation is str
+    assert root_fields["name"].is_required()
+
+    assert "children" in root_fields
+    # The recursive reference should resolve to a safe fallback instead of recursing forever
+    assert str(root_fields["children"].annotation).startswith("typing.List")
+    children_type = root_fields["children"].annotation.__args__[0]
+    assert children_type is Any
+
+    metadata_type, metadata_field = model_fields["metadata"]
+    assert metadata_field.default is None
+    assert issubclass(metadata_type, BaseModel)

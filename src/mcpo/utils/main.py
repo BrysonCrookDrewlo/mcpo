@@ -160,6 +160,7 @@ def _process_schema_property(
     is_required: bool,
     schema_defs: Optional[Dict[str, Any]] = None,
     root_schema: Optional[Dict[str, Any]] = None,
+    active_ref_chain: Optional[tuple[str, ...]] = None,
 ) -> tuple[Union[Type, List, ForwardRef, Any], FieldInfo]:
     """
     Recursively processes a schema property to determine its Python type hint
@@ -172,7 +173,20 @@ def _process_schema_property(
     available_defs: Dict[str, Any] = dict(schema_defs or {})
 
     schema_to_process = prop_schema
-    seen_refs = set()
+    current_ref_chain: tuple[str, ...] = active_ref_chain or tuple()
+
+    def build_field(schema: Optional[Dict[str, Any]] = None) -> FieldInfo:
+        base_schema: Dict[str, Any]
+        if isinstance(schema, dict):
+            base_schema = schema
+        elif isinstance(prop_schema, dict):
+            base_schema = prop_schema
+        else:
+            base_schema = {}
+
+        description = base_schema.get("description", "")
+        default_value = ... if is_required else base_schema.get("default", None)
+        return Field(default=default_value, description=description)
 
     while isinstance(schema_to_process, dict) and "$ref" in schema_to_process:
         ref = schema_to_process["$ref"]
@@ -189,11 +203,12 @@ def _process_schema_property(
             # The loop should be broken with a return to avoid exception.
             if prefix_path.startswith(ref_path):
                 # TODO: Find the exact type hint for the $ref.
-                return Any, Field(default=None, description="")
+                return Any, build_field(schema_to_process)
 
-        if ref in seen_refs:
-            return Any, Field(default=None, description="")
-        seen_refs.add(ref)
+        if ref in current_ref_chain:
+            return Any, build_field(schema_to_process)
+
+        updated_ref_chain = current_ref_chain + (ref,)
 
         local_defs = schema_to_process.get("$defs")
         if isinstance(local_defs, dict):
@@ -205,11 +220,12 @@ def _process_schema_property(
             resolved_schema = available_defs.get(ref_key)
 
         if resolved_schema is None:
-            return Any, Field(default=None, description="")
+            return Any, build_field(schema_to_process)
 
         schema_to_process = resolved_schema
+        current_ref_chain = updated_ref_chain
 
-    prop_schema = schema_to_process
+    prop_schema = schema_to_process if isinstance(schema_to_process, dict) else {}
 
     final_defs = prop_schema.get("$defs") if isinstance(prop_schema, dict) else None
     if isinstance(final_defs, dict):
@@ -234,6 +250,7 @@ def _process_schema_property(
                 False,
                 schema_defs=available_defs,
                 root_schema=root_schema,
+                active_ref_chain=current_ref_chain,
             )
             type_hints.append(type_hint)
         return Union[tuple(type_hints)], pydantic_field
@@ -254,6 +271,7 @@ def _process_schema_property(
                 False,
                 schema_defs=available_defs,
                 root_schema=root_schema,
+                active_ref_chain=current_ref_chain,
             )
             type_hints.append(type_hint)
 
@@ -282,6 +300,7 @@ def _process_schema_property(
                 is_nested_required,
                 available_defs,
                 root_schema,
+                current_ref_chain,
             )
 
             if name_needs_alias(name):
@@ -321,6 +340,7 @@ def _process_schema_property(
             False,  # Items aren't required at this level,
             available_defs,
             root_schema,
+            current_ref_chain,
         )
         list_type_hint = List[item_type_hint]
         return list_type_hint, pydantic_field
