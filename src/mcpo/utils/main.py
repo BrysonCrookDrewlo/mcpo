@@ -82,13 +82,84 @@ def generate_alias_name(original_name: str, existing_names: set) -> str:
     return alias_name
 
 
+def _resolve_json_pointer(
+    pointer: str,
+    root_schema: Optional[Dict[str, Any]],
+    schema_defs: Optional[Dict[str, Any]] = None,
+) -> Optional[Any]:
+    """Resolve a JSON Pointer against the provided schema."""
+
+    if not isinstance(pointer, str) or not pointer.startswith("#"):
+        return None
+
+    # Normalize the pointer by stripping the leading '#/' (if present)
+    normalized_pointer = pointer[1:]
+    if normalized_pointer.startswith("/"):
+        normalized_pointer = normalized_pointer[1:]
+
+    # Prepare the root schema, merging in available definitions so that
+    # references to '#/$defs/...' can include nested definitions discovered
+    # during traversal.
+    traversal_root: Any
+    if isinstance(root_schema, dict):
+        traversal_root = root_schema
+    else:
+        traversal_root = {}
+
+    combined_defs: Dict[str, Any] = {}
+    if isinstance(traversal_root, dict):
+        root_defs = traversal_root.get("$defs")
+        if isinstance(root_defs, dict):
+            combined_defs.update(root_defs)
+    if schema_defs:
+        combined_defs.update(schema_defs)
+
+    if combined_defs:
+        # Avoid mutating the original root schema by copying the first level
+        # before inserting the merged definitions.
+        if isinstance(traversal_root, dict):
+            root_copy = dict(traversal_root)
+            root_copy["$defs"] = dict(combined_defs)
+            traversal_root = root_copy
+        else:
+            traversal_root = {"$defs": dict(combined_defs)}
+
+    if not normalized_pointer:
+        return traversal_root
+
+    segments = [segment for segment in normalized_pointer.split("/") if segment != ""]
+
+    current: Any = traversal_root
+    for raw_segment in segments:
+        segment = raw_segment.replace("~1", "/").replace("~0", "~")
+
+        if isinstance(current, dict):
+            if segment not in current:
+                return None
+            current = current[segment]
+        elif isinstance(current, list):
+            try:
+                index = int(segment)
+            except ValueError:
+                return None
+
+            if index < 0 or index >= len(current):
+                return None
+            current = current[index]
+        else:
+            return None
+
+    return current
+
+
 def _process_schema_property(
     _model_cache: Dict[str, Type],
     prop_schema: Dict[str, Any],
     model_name_prefix: str,
     prop_name: str,
     is_required: bool,
-    schema_defs: Optional[Dict] = None,
+    schema_defs: Optional[Dict[str, Any]] = None,
+    root_schema: Optional[Dict[str, Any]] = None,
 ) -> tuple[Union[Type, List, ForwardRef, Any], FieldInfo]:
     """
     Recursively processes a schema property to determine its Python type hint
@@ -98,10 +169,16 @@ def _process_schema_property(
         A tuple containing (python_type_hint, pydantic_field).
         The pydantic_field contains default value and description.
     """
-    if "$ref" in prop_schema:
-        ref = prop_schema["$ref"]
+    available_defs: Dict[str, Any] = dict(schema_defs or {})
+
+    schema_to_process = prop_schema
+    seen_refs = set()
+
+    while isinstance(schema_to_process, dict) and "$ref" in schema_to_process:
+        ref = schema_to_process["$ref"]
+
         if ref.startswith("#/properties/"):
-            # Remove common prefix in pathes.
+            # Remove common prefix in paths.
             prefix_path = model_name_prefix.split("_form_model_")[-1]
             ref_path = ref.split("#/properties/")[-1]
             # Translate $ref path to model_name_prefix style.
@@ -109,13 +186,34 @@ def _process_schema_property(
             ref_path = ref_path.replace("/items", "_item")
             # If $ref path is a prefix substring of model_name_prefix path,
             # there exists a circular reference.
-            # The loop should be broke with a return to avoid exception.
+            # The loop should be broken with a return to avoid exception.
             if prefix_path.startswith(ref_path):
                 # TODO: Find the exact type hint for the $ref.
                 return Any, Field(default=None, description="")
-        ref = ref.split("/")[-1]
-        assert ref in schema_defs, "Custom field not found"
-        prop_schema = schema_defs[ref]
+
+        if ref in seen_refs:
+            return Any, Field(default=None, description="")
+        seen_refs.add(ref)
+
+        local_defs = schema_to_process.get("$defs")
+        if isinstance(local_defs, dict):
+            available_defs.update(local_defs)
+
+        resolved_schema = _resolve_json_pointer(ref, root_schema, available_defs)
+        if resolved_schema is None and available_defs:
+            ref_key = ref.split("/")[-1]
+            resolved_schema = available_defs.get(ref_key)
+
+        if resolved_schema is None:
+            return Any, Field(default=None, description="")
+
+        schema_to_process = resolved_schema
+
+    prop_schema = schema_to_process
+
+    final_defs = prop_schema.get("$defs") if isinstance(prop_schema, dict) else None
+    if isinstance(final_defs, dict):
+        available_defs.update(final_defs)
 
     prop_type = prop_schema.get("type")
     prop_desc = prop_schema.get("description", "")
@@ -134,7 +232,8 @@ def _process_schema_property(
                 f"{model_name_prefix}_{prop_name}",
                 f"choice_{i}",
                 False,
-                schema_defs=schema_defs,
+                schema_defs=available_defs,
+                root_schema=root_schema,
             )
             type_hints.append(type_hint)
         return Union[tuple(type_hints)], pydantic_field
@@ -148,7 +247,13 @@ def _process_schema_property(
             temp_schema = dict(prop_schema)
             temp_schema["type"] = type_option
             type_hint, _ = _process_schema_property(
-                _model_cache, temp_schema, model_name_prefix, prop_name, False, schema_defs=schema_defs
+                _model_cache,
+                temp_schema,
+                model_name_prefix,
+                prop_name,
+                False,
+                schema_defs=available_defs,
+                root_schema=root_schema,
             )
             type_hints.append(type_hint)
 
@@ -175,7 +280,8 @@ def _process_schema_property(
                 nested_model_name,
                 name,
                 is_nested_required,
-                schema_defs,
+                available_defs,
+                root_schema,
             )
 
             if name_needs_alias(name):
@@ -213,7 +319,8 @@ def _process_schema_property(
             f"{model_name_prefix}_{prop_name}",
             "item",
             False,  # Items aren't required at this level,
-            schema_defs,
+            available_defs,
+            root_schema,
         )
         list_type_hint = List[item_type_hint]
         return list_type_hint, pydantic_field
@@ -232,7 +339,13 @@ def _process_schema_property(
         return Any, pydantic_field
 
 
-def get_model_fields(form_model_name, properties, required_fields, schema_defs=None):
+def get_model_fields(
+    form_model_name,
+    properties,
+    required_fields,
+    schema_defs=None,
+    root_schema=None,
+):
     model_fields = {}
 
     _model_cache: Dict[str, Type] = {}
@@ -246,6 +359,7 @@ def get_model_fields(form_model_name, properties, required_fields, schema_defs=N
             param_name,
             is_required,
             schema_defs,
+            root_schema,
         )
 
         # Handle parameter names with leading underscores (e.g., __top, __filter) which Pydantic v2 does not allow
